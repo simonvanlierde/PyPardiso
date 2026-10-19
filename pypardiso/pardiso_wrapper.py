@@ -3,6 +3,7 @@ import os
 import sys
 import glob
 import ctypes
+import functools
 import warnings
 import hashlib
 import site
@@ -11,6 +12,53 @@ from ctypes.util import find_library
 import numpy as np
 import scipy.sparse as sp
 from scipy.sparse import SparseEfficiencyWarning
+
+
+@functools.lru_cache(maxsize=None)
+def _load_mkl_rt(mkl_rt):
+    """Load the mkl_rt shared library, from the path ``mkl_rt`` or else by searching for it.
+
+    Cached, because the search can walk the whole environment (see below) and every
+    PyPardisoSolver needs the library. Keyed on the path from PYPARDISO_MKL_RT, so setting
+    that variable later still takes effect. A failed search raises and is not cached.
+    """
+
+    # Look for the mkl_rt shared library with ctypes.util.find_library
+    if mkl_rt is None:
+        mkl_rt = find_library('mkl_rt')
+    # also look for mkl_rt.1, Windows-specific, see
+    # https://github.com/haasad/PyPardisoProject/issues/12
+    if mkl_rt is None:
+        mkl_rt = find_library('mkl_rt.1')
+
+    # If we can't find mkl_rt with find_library, we search the directory
+    # tree, using a few assumptions:
+    # - the shared library can be found in a subdirectory of sys.prefix
+    #   https://docs.python.org/3.9/library/sys.html#sys.prefix
+    #   or in the user site in case of user-local installation like
+    #   `pip install --user`
+    #   https://peps.python.org/pep-0370/
+    #   https://docs.python.org/3/library/site.html#site.USER_BASE
+    # - either in `lib` (linux and macOS) or `Library\bin` (windows)
+    # - if there are multiple matches for `mkl_rt`, try shorter paths
+    #   first
+    if mkl_rt is None:
+        globs = glob.glob(
+            f'{sys.prefix}/[Ll]ib*/**/*mkl_rt*', recursive=True
+        ) or glob.glob(
+            f'{site.USER_BASE}/[Ll]ib*/**/*mkl_rt*', recursive=True
+        )
+        for path in sorted(globs, key=len):
+            try:
+                return ctypes.CDLL(path)
+            except (OSError, ImportError):
+                pass
+
+        raise ImportError(
+            'Shared library mkl_rt not found. '
+            'Use environment variable PYPARDISO_MKL_RT to provide a custom path.'
+        )
+    return ctypes.CDLL(mkl_rt)
 
 
 class PyPardisoSolver:
@@ -58,50 +106,8 @@ class PyPardisoSolver:
 
     def __init__(self, mtype=11, phase=13, size_limit_storage=5e7):
 
-        self.libmkl = None
-
         # custom mkl_rt path in environment variable
-        mkl_rt = os.environ.get('PYPARDISO_MKL_RT')
-
-        # Look for the mkl_rt shared library with ctypes.util.find_library
-        if mkl_rt is None:
-            mkl_rt = find_library('mkl_rt')
-        # also look for mkl_rt.1, Windows-specific, see
-        # https://github.com/haasad/PyPardisoProject/issues/12
-        if mkl_rt is None:
-            mkl_rt = find_library('mkl_rt.1')
-
-        # If we can't find mkl_rt with find_library, we search the directory
-        # tree, using a few assumptions:
-        # - the shared library can be found in a subdirectory of sys.prefix
-        #   https://docs.python.org/3.9/library/sys.html#sys.prefix
-        #   or in the user site in case of user-local installation like
-        #   `pip install --user`
-        #   https://peps.python.org/pep-0370/
-        #   https://docs.python.org/3/library/site.html#site.USER_BASE
-        # - either in `lib` (linux and macOS) or `Library\bin` (windows)
-        # - if there are multiple matches for `mkl_rt`, try shorter paths
-        #   first
-        if mkl_rt is None:
-            globs = glob.glob(
-                f'{sys.prefix}/[Ll]ib*/**/*mkl_rt*', recursive=True
-            ) or glob.glob(
-                f'{site.USER_BASE}/[Ll]ib*/**/*mkl_rt*', recursive=True
-            )
-            for path in sorted(globs, key=len):
-                try:
-                    self.libmkl = ctypes.CDLL(path)
-                    break
-                except (OSError, ImportError):
-                    pass
-
-            if self.libmkl is None:
-                raise ImportError(
-                    'Shared library mkl_rt not found. '
-                    'Use environment variable PYPARDISO_MKL_RT to provide a custom path.'
-                )
-        else:
-            self.libmkl = ctypes.CDLL(mkl_rt)
+        self.libmkl = _load_mkl_rt(os.environ.get('PYPARDISO_MKL_RT'))
 
         self._mkl_pardiso = self.libmkl.pardiso
 
